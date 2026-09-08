@@ -1,32 +1,3 @@
-<<<<<<< HEAD
-# Environment / secrets
-.env
-.env.*
-!.env.example
-
-# Google OAuth token
-token.json
-
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-
-# Virtual environment
-venv/
-.venv/
-
-# IDE
-.vscode/
-.idea/
-
-# Logs
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
-=======
 .env
 token.json
 venv/
@@ -35,4 +6,7 @@ __pycache__/
 .vscode/
 .idea/
 *.log
->>>>>>> develop
+
+
+# MaxMind databases
+data/*.mmdb
