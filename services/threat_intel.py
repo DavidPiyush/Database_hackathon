@@ -1,29 +1,6 @@
-"""
-Threat Intelligence Service
-============================
-
-Responsible for enriching email IOCs with external and local
-threat-intelligence information.
-
-Supported intelligence types:
-    - IP intelligence
-    - Domain intelligence
-    - URL intelligence
-
-Design principles:
-    - External APIs are optional.
-    - Failures must not break email analysis.
-    - Never claim attribution from reputation/geolocation alone.
-    - Preserve evidence provenance.
-    - Return normalized data to the analysis/risk engine.
-
-Environment variables:
-    ABUSEIPDB_API_KEY=
-    VIRUSTOTAL_API_KEY=
-"""
-
 from __future__ import annotations
 
+import asyncio
 import base64
 import ipaddress
 import os
@@ -34,63 +11,33 @@ from urllib.parse import quote, urlparse
 import requests
 from dotenv import load_dotenv
 
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
-
 load_dotenv()
-
 
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
 VIRUSTOTAL_IP_URL = "https://www.virustotal.com/api/v3/ip_addresses"
 VIRUSTOTAL_DOMAIN_URL = "https://www.virustotal.com/api/v3/domains"
 VIRUSTOTAL_URL_URL = "https://www.virustotal.com/api/v3/urls"
 
-
 DEFAULT_TIMEOUT = 8
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
+TI_CONCURRENCY = max(1, int(os.getenv("TI_CONCURRENCY", "5")))
 
 
 class ThreatIntelError(Exception):
-    """Base exception for threat-intelligence failures."""
+    pass
 
 
 class ThreatIntelProviderError(ThreatIntelError):
-    """Raised when an external TI provider fails."""
-
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
+    pass
 
 
 def utc_now() -> str:
-    """
-    Return current UTC timestamp in ISO-8601 format.
-    """
     return datetime.now(timezone.utc).isoformat()
 
 
 def normalize_ip(value: str) -> str | None:
-    """
-    Validate and normalize an IP address.
-
-    Returns:
-        Normalized IP string or None.
-    """
     try:
         return str(ipaddress.ip_address(value.strip()))
     except (ValueError, AttributeError):
@@ -98,79 +45,47 @@ def normalize_ip(value: str) -> str | None:
 
 
 def is_public_ip(value: str) -> bool:
-    """
-    Determine whether an IP is globally routable/public.
-
-    Private, loopback, reserved, link-local and documentation
-    addresses are not treated as public threat-intelligence targets.
-    """
     normalized = normalize_ip(value)
-
     if not normalized:
         return False
-
     try:
-        ip = ipaddress.ip_address(normalized)
-        return ip.is_global
+        return ipaddress.ip_address(normalized).is_global
     except ValueError:
         return False
 
 
 def normalize_domain(domain: str) -> str | None:
-    """
-    Normalize a domain name.
-
-    This function intentionally does not perform DNS resolution.
-    """
     if not domain:
         return None
-
     domain = domain.strip().lower().rstrip(".")
-
     if domain.startswith("@"):
         domain = domain[1:]
-
-    if not domain:
-        return None
-
-    return domain
+    return domain or None
 
 
 def normalize_url(url: str) -> str | None:
-    """
-    Normalize a URL for TI lookup.
-    """
     if not url:
         return None
-
     url = url.strip()
-
     if not url:
         return None
-
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {"http", "https"}:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
         return None
-
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
     if not parsed.hostname:
         return None
-
     return url
 
 
 def extract_url_hostname(url: str) -> str | None:
-    """
-    Extract hostname from a URL.
-    """
     try:
         parsed = urlparse(url)
-
         if not parsed.hostname:
             return None
-
         return parsed.hostname.lower().rstrip(".")
-
     except Exception:
         return None
 
@@ -182,9 +97,6 @@ def build_evidence(
     indicator: str,
     source_url: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Create a standard evidence/provenance structure.
-    """
     return {
         "provider": provider,
         "indicator_type": indicator_type,
@@ -192,11 +104,6 @@ def build_evidence(
         "source": source_url,
         "observed_at": utc_now(),
     }
-
-
-# ---------------------------------------------------------------------------
-# Base result builders
-# ---------------------------------------------------------------------------
 
 
 def empty_ip_result(ip: str) -> dict[str, Any]:
@@ -260,25 +167,13 @@ def empty_url_result(url: str) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# AbuseIPDB
-# ---------------------------------------------------------------------------
-
-
 def check_abuseipdb(
     ip: str,
     *,
     max_age_days: int = 90,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """
-    Query AbuseIPDB for an IP address.
-
-    The API key is optional. If it is not configured, the result
-    remains unavailable instead of failing the entire analysis.
-    """
     result = empty_ip_result(ip)
-
     normalized = normalize_ip(ip)
 
     if not normalized:
@@ -293,34 +188,24 @@ def check_abuseipdb(
         result["errors"].append("ABUSEIPDB_API_KEY is not configured")
         return result
 
-    headers = {
-        "Accept": "application/json",
-        "Key": ABUSEIPDB_API_KEY,
-    }
-
-    params = {
-        "ipAddress": normalized,
-        "maxAgeInDays": max_age_days,
-        "verbose": "",
-    }
-
     try:
         response = requests.get(
             ABUSEIPDB_URL,
-            headers=headers,
-            params=params,
+            headers={
+                "Accept": "application/json",
+                "Key": ABUSEIPDB_API_KEY,
+            },
+            params={
+                "ipAddress": normalized,
+                "maxAgeInDays": max_age_days,
+                "verbose": "",
+            },
             timeout=timeout,
         )
-
         response.raise_for_status()
 
-        payload = response.json()
-        data = payload.get("data", {})
-
-        abuse_confidence = int(
-            data.get("abuseConfidenceScore") or 0
-        )
-
+        data = response.json().get("data", {})
+        abuse_confidence = int(data.get("abuseConfidenceScore") or 0)
         reports = int(data.get("totalReports") or 0)
 
         result.update(
@@ -333,27 +218,19 @@ def check_abuseipdb(
                 "isp": data.get("isp"),
                 "organization": data.get("domain"),
                 "is_tor": bool(data.get("isTor")),
-                "categories": data.get("usageType")
-                if data.get("usageType")
-                else [],
+                "categories": [data["usageType"]] if data.get("usageType") else [],
             }
         )
 
         if abuse_confidence >= 80:
             result["reputation"] = "malicious"
             result["threat_score"] = min(abuse_confidence, 100)
-
         elif abuse_confidence >= 50:
             result["reputation"] = "suspicious"
             result["threat_score"] = abuse_confidence
-
         elif abuse_confidence > 0:
             result["reputation"] = "low_risk"
             result["threat_score"] = abuse_confidence
-
-        else:
-            result["reputation"] = "unknown"
-            result["threat_score"] = 0
 
         result["evidence"].append(
             build_evidence(
@@ -363,32 +240,17 @@ def check_abuseipdb(
                 source_url=ABUSEIPDB_URL,
             )
         )
-
     except requests.RequestException as exc:
-        result["errors"].append(
-            f"AbuseIPDB request failed: {exc}"
-        )
-
+        result["errors"].append(f"AbuseIPDB request failed: {exc}")
     except (ValueError, TypeError) as exc:
-        result["errors"].append(
-            f"AbuseIPDB response parsing failed: {exc}"
-        )
+        result["errors"].append(f"AbuseIPDB response parsing failed: {exc}")
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# VirusTotal helpers
-# ---------------------------------------------------------------------------
-
-
 def _virustotal_headers() -> dict[str, str] | None:
-    """
-    Return VirusTotal headers when an API key is configured.
-    """
     if not VIRUSTOTAL_API_KEY:
         return None
-
     return {
         "x-apikey": VIRUSTOTAL_API_KEY,
         "Accept": "application/json",
@@ -396,11 +258,7 @@ def _virustotal_headers() -> dict[str, str] | None:
 
 
 def _extract_vt_stats(attributes: dict[str, Any]) -> dict[str, int]:
-    """
-    Normalize VirusTotal engine statistics.
-    """
     stats = attributes.get("last_analysis_stats") or {}
-
     return {
         "malicious": int(stats.get("malicious") or 0),
         "suspicious": int(stats.get("suspicious") or 0),
@@ -411,11 +269,6 @@ def _extract_vt_stats(attributes: dict[str, Any]) -> dict[str, int]:
 
 
 def _calculate_vt_score(stats: dict[str, int]) -> int:
-    """
-    Convert VirusTotal detections into a normalized 0-100 score.
-
-    This is a local normalization, not an official VirusTotal score.
-    """
     malicious = stats.get("malicious", 0)
     suspicious = stats.get("suspicious", 0)
     total = sum(stats.values())
@@ -423,17 +276,10 @@ def _calculate_vt_score(stats: dict[str, int]) -> int:
     if total <= 0:
         return 0
 
-    score = (
-        (malicious / total) * 100
-        + (suspicious / total) * 30
+    return min(
+        round((malicious / total) * 100 + (suspicious / total) * 30),
+        100,
     )
-
-    return min(round(score), 100)
-
-
-# ---------------------------------------------------------------------------
-# VirusTotal IP
-# ---------------------------------------------------------------------------
 
 
 def check_virustotal_ip(
@@ -441,11 +287,7 @@ def check_virustotal_ip(
     *,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """
-    Query VirusTotal for an IP address.
-    """
     result = empty_ip_result(ip)
-
     normalized = normalize_ip(ip)
 
     if not normalized:
@@ -459,35 +301,31 @@ def check_virustotal_ip(
     headers = _virustotal_headers()
 
     if not headers:
-        result["errors"].append(
-            "VIRUSTOTAL_API_KEY is not configured"
-        )
+        result["errors"].append("VIRUSTOTAL_API_KEY is not configured")
         return result
 
-    url = f"{VIRUSTOTAL_IP_URL}/{normalized}"
+    endpoint = f"{VIRUSTOTAL_IP_URL}/{normalized}"
 
     try:
         response = requests.get(
-            url,
+            endpoint,
             headers=headers,
             timeout=timeout,
         )
-
         response.raise_for_status()
 
-        payload = response.json()
         attributes = (
-            payload.get("data", {})
+            response.json()
+            .get("data", {})
             .get("attributes", {})
         )
 
         stats = _extract_vt_stats(attributes)
-        threat_score = _calculate_vt_score(stats)
 
         result.update(
             {
                 "available": True,
-                "threat_score": threat_score,
+                "threat_score": _calculate_vt_score(stats),
                 "country": attributes.get("country"),
                 "country_code": attributes.get("country"),
                 "asn": attributes.get("asn"),
@@ -497,108 +335,42 @@ def check_virustotal_ip(
 
         if stats["malicious"] > 0:
             result["reputation"] = "malicious"
-
         elif stats["suspicious"] > 0:
             result["reputation"] = "suspicious"
-
-        else:
-            result["reputation"] = "unknown"
 
         result["evidence"].append(
             build_evidence(
                 provider="VirusTotal",
                 indicator_type="ip",
                 indicator=normalized,
-                source_url=url,
+                source_url=endpoint,
             )
         )
-
     except requests.RequestException as exc:
-        result["errors"].append(
-            f"VirusTotal IP request failed: {exc}"
-        )
-
+        result["errors"].append(f"VirusTotal IP request failed: {exc}")
     except (ValueError, TypeError) as exc:
-        result["errors"].append(
-            f"VirusTotal IP response parsing failed: {exc}"
-        )
+        result["errors"].append(f"VirusTotal IP response parsing failed: {exc}")
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Combined IP Intelligence
-# ---------------------------------------------------------------------------
-
-
-def enrich_ip(
+def _merge_ip_provider_results(
     ip: str,
-    *,
-    use_abuseipdb: bool = True,
-    use_virustotal: bool = True,
+    providers: dict[str, Any],
 ) -> dict[str, Any]:
-    """
-    Enrich an IP address using configured TI providers.
-
-    Provider results are preserved separately so that investigators
-    can see where each signal originated.
-    """
-    normalized = normalize_ip(ip)
-
     result = empty_ip_result(ip)
-
-    if not normalized:
-        result["errors"].append("Invalid IP address")
-        return result
-
-    if not is_public_ip(normalized):
-        result["errors"].append(
-            "IP is not globally routable"
-        )
-        return result
-
-    providers: dict[str, Any] = {}
-
-    if use_abuseipdb:
-        providers["abuseipdb"] = check_abuseipdb(normalized)
-
-    if use_virustotal:
-        providers["virustotal"] = check_virustotal_ip(normalized)
-
     scores = []
     reputations = []
 
     for provider_result in providers.values():
-
         if provider_result.get("available"):
-            scores.append(
-                int(provider_result.get("threat_score") or 0)
-            )
-
+            scores.append(int(provider_result.get("threat_score") or 0))
             reputation = provider_result.get("reputation")
-
             if reputation:
                 reputations.append(reputation)
-
             result["evidence"].extend(
                 provider_result.get("evidence", [])
             )
-
-    if scores:
-        result["available"] = True
-        result["threat_score"] = max(scores)
-
-    if "malicious" in reputations:
-        result["reputation"] = "malicious"
-
-    elif "suspicious" in reputations:
-        result["reputation"] = "suspicious"
-
-    elif reputations:
-        result["reputation"] = reputations[0]
-
-    # Prefer the strongest available metadata.
-    for provider_result in providers.values():
 
         for field in (
             "country",
@@ -612,21 +384,52 @@ def enrich_ip(
 
         if provider_result.get("is_tor"):
             result["is_tor"] = True
-
         if provider_result.get("is_vpn"):
             result["is_vpn"] = True
-
         if provider_result.get("is_proxy"):
             result["is_proxy"] = True
 
-    result["providers"] = providers
+    if scores:
+        result["available"] = True
+        result["threat_score"] = max(scores)
 
+    if "malicious" in reputations:
+        result["reputation"] = "malicious"
+    elif "suspicious" in reputations:
+        result["reputation"] = "suspicious"
+    elif reputations:
+        result["reputation"] = reputations[0]
+
+    result["providers"] = providers
     return result
 
 
-# ---------------------------------------------------------------------------
-# VirusTotal Domain
-# ---------------------------------------------------------------------------
+def enrich_ip(
+    ip: str,
+    *,
+    use_abuseipdb: bool = True,
+    use_virustotal: bool = True,
+) -> dict[str, Any]:
+    normalized = normalize_ip(ip)
+    result = empty_ip_result(ip)
+
+    if not normalized:
+        result["errors"].append("Invalid IP address")
+        return result
+
+    if not is_public_ip(normalized):
+        result["errors"].append("IP is not globally routable")
+        return result
+
+    providers = {}
+
+    if use_abuseipdb:
+        providers["abuseipdb"] = check_abuseipdb(normalized)
+
+    if use_virustotal:
+        providers["virustotal"] = check_virustotal_ip(normalized)
+
+    return _merge_ip_provider_results(normalized, providers)
 
 
 def check_virustotal_domain(
@@ -634,11 +437,7 @@ def check_virustotal_domain(
     *,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """
-    Query VirusTotal for a domain.
-    """
     result = empty_domain_result(domain)
-
     normalized = normalize_domain(domain)
 
     if not normalized:
@@ -648,70 +447,52 @@ def check_virustotal_domain(
     headers = _virustotal_headers()
 
     if not headers:
-        result["errors"].append(
-            "VIRUSTOTAL_API_KEY is not configured"
-        )
+        result["errors"].append("VIRUSTOTAL_API_KEY is not configured")
         return result
 
-    url = (
-        f"{VIRUSTOTAL_DOMAIN_URL}/"
-        f"{quote(normalized, safe='')}"
-    )
+    endpoint = f"{VIRUSTOTAL_DOMAIN_URL}/{quote(normalized, safe='')}"
 
     try:
         response = requests.get(
-            url,
+            endpoint,
             headers=headers,
             timeout=timeout,
         )
-
         response.raise_for_status()
 
-        payload = response.json()
-
         attributes = (
-            payload.get("data", {})
+            response.json()
+            .get("data", {})
             .get("attributes", {})
         )
 
         stats = _extract_vt_stats(attributes)
-        threat_score = _calculate_vt_score(stats)
 
         result.update(
             {
                 "available": True,
-                "threat_score": threat_score,
-                "resolutions": attributes.get(
-                    "last_dns_records", []
-                ),
+                "threat_score": _calculate_vt_score(stats),
+                "resolutions": attributes.get("last_dns_records", []),
             }
         )
 
         if stats["malicious"] > 0:
             result["malicious"] = True
             result["reputation"] = "malicious"
-
         elif stats["suspicious"] > 0:
             result["suspicious"] = True
             result["reputation"] = "suspicious"
-
-        else:
-            result["reputation"] = "unknown"
 
         result["evidence"].append(
             build_evidence(
                 provider="VirusTotal",
                 indicator_type="domain",
                 indicator=normalized,
-                source_url=url,
+                source_url=endpoint,
             )
         )
-
     except requests.RequestException as exc:
-        result["errors"].append(
-            f"VirusTotal domain request failed: {exc}"
-        )
-
+        result["errors"].append(f"VirusTotal domain request failed: {exc}")
     except (ValueError, TypeError) as exc:
         result["errors"].append(
             f"VirusTotal domain response parsing failed: {exc}"
@@ -720,9 +501,53 @@ def check_virustotal_domain(
     return result
 
 
-# ---------------------------------------------------------------------------
-# VirusTotal URL
-# ---------------------------------------------------------------------------
+def enrich_domain(
+    domain: str,
+    *,
+    use_virustotal: bool = True,
+) -> dict[str, Any]:
+    normalized = normalize_domain(domain)
+    result = empty_domain_result(domain)
+
+    if not normalized:
+        result["errors"].append("Invalid domain")
+        return result
+
+    providers = {}
+
+    if use_virustotal:
+        providers["virustotal"] = check_virustotal_domain(normalized)
+
+    scores = []
+    reputations = []
+
+    for provider_result in providers.values():
+        if provider_result.get("available"):
+            scores.append(int(provider_result.get("threat_score") or 0))
+            reputations.append(
+                provider_result.get("reputation", "unknown")
+            )
+            result["evidence"].extend(
+                provider_result.get("evidence", [])
+            )
+            if provider_result.get("malicious"):
+                result["malicious"] = True
+            if provider_result.get("suspicious"):
+                result["suspicious"] = True
+
+    if scores:
+        result["available"] = True
+        result["threat_score"] = max(scores)
+
+    if "malicious" in reputations:
+        result["reputation"] = "malicious"
+    elif "suspicious" in reputations:
+        result["reputation"] = "suspicious"
+    elif reputations:
+        result["reputation"] = reputations[0]
+
+    result["providers"] = providers
+    return result
 
 
 def check_virustotal_url(
@@ -730,14 +555,7 @@ def check_virustotal_url(
     *,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """
-    Query VirusTotal for an exact URL.
-
-    VirusTotal URL lookup uses the URL identifier obtained by
-    URL-safe base64 encoding without trailing '=' characters.
-    """
     result = empty_url_result(url)
-
     normalized = normalize_url(url)
 
     if not normalized:
@@ -747,9 +565,7 @@ def check_virustotal_url(
     headers = _virustotal_headers()
 
     if not headers:
-        result["errors"].append(
-            "VIRUSTOTAL_API_KEY is not configured"
-        )
+        result["errors"].append("VIRUSTOTAL_API_KEY is not configured")
         return result
 
     encoded_url = (
@@ -768,23 +584,20 @@ def check_virustotal_url(
             headers=headers,
             timeout=timeout,
         )
-
         response.raise_for_status()
 
-        payload = response.json()
-
         attributes = (
-            payload.get("data", {})
+            response.json()
+            .get("data", {})
             .get("attributes", {})
         )
 
         stats = _extract_vt_stats(attributes)
-        threat_score = _calculate_vt_score(stats)
 
         result.update(
             {
                 "available": True,
-                "threat_score": threat_score,
+                "threat_score": _calculate_vt_score(stats),
                 "final_url": attributes.get("last_final_url"),
             }
         )
@@ -792,13 +605,9 @@ def check_virustotal_url(
         if stats["malicious"] > 0:
             result["malicious"] = True
             result["reputation"] = "malicious"
-
         elif stats["suspicious"] > 0:
             result["suspicious"] = True
             result["reputation"] = "suspicious"
-
-        else:
-            result["reputation"] = "unknown"
 
         result["evidence"].append(
             build_evidence(
@@ -808,12 +617,8 @@ def check_virustotal_url(
                 source_url=endpoint,
             )
         )
-
     except requests.RequestException as exc:
-        result["errors"].append(
-            f"VirusTotal URL request failed: {exc}"
-        )
-
+        result["errors"].append(f"VirusTotal URL request failed: {exc}")
     except (ValueError, TypeError) as exc:
         result["errors"].append(
             f"VirusTotal URL response parsing failed: {exc}"
@@ -822,134 +627,37 @@ def check_virustotal_url(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Domain Intelligence
-# ---------------------------------------------------------------------------
-
-
-def enrich_domain(
-    domain: str,
-    *,
-    use_virustotal: bool = True,
-) -> dict[str, Any]:
-    """
-    Enrich a domain with available TI providers.
-    """
-    normalized = normalize_domain(domain)
-
-    result = empty_domain_result(domain)
-
-    if not normalized:
-        result["errors"].append("Invalid domain")
-        return result
-
-    providers = {}
-
-    if use_virustotal:
-        providers["virustotal"] = check_virustotal_domain(
-            normalized
-        )
-
-    scores = []
-    reputations = []
-
-    for provider_result in providers.values():
-
-        if provider_result.get("available"):
-            scores.append(
-                int(provider_result.get("threat_score") or 0)
-            )
-
-            reputations.append(
-                provider_result.get(
-                    "reputation",
-                    "unknown",
-                )
-            )
-
-            result["evidence"].extend(
-                provider_result.get("evidence", [])
-            )
-
-            if provider_result.get("malicious"):
-                result["malicious"] = True
-
-            if provider_result.get("suspicious"):
-                result["suspicious"] = True
-
-    if scores:
-        result["available"] = True
-        result["threat_score"] = max(scores)
-
-    if "malicious" in reputations:
-        result["reputation"] = "malicious"
-
-    elif "suspicious" in reputations:
-        result["reputation"] = "suspicious"
-
-    elif reputations:
-        result["reputation"] = reputations[0]
-
-    result["providers"] = providers
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# URL Intelligence
-# ---------------------------------------------------------------------------
-
-
 def enrich_url(
     url: str,
     *,
     use_virustotal: bool = True,
 ) -> dict[str, Any]:
-    """
-    Enrich a URL using available TI providers.
-    """
     normalized = normalize_url(url)
-
     result = empty_url_result(url)
 
     if not normalized:
-        result["errors"].append(
-            "Invalid HTTP/HTTPS URL"
-        )
+        result["errors"].append("Invalid HTTP/HTTPS URL")
         return result
 
     providers = {}
 
     if use_virustotal:
-        providers["virustotal"] = check_virustotal_url(
-            normalized
-        )
+        providers["virustotal"] = check_virustotal_url(normalized)
 
     scores = []
     reputations = []
 
     for provider_result in providers.values():
-
         if provider_result.get("available"):
-
-            scores.append(
-                int(provider_result.get("threat_score") or 0)
-            )
-
+            scores.append(int(provider_result.get("threat_score") or 0))
             reputations.append(
-                provider_result.get(
-                    "reputation",
-                    "unknown",
-                )
+                provider_result.get("reputation", "unknown")
             )
-
             result["evidence"].extend(
                 provider_result.get("evidence", [])
             )
-
             if provider_result.get("malicious"):
                 result["malicious"] = True
-
             if provider_result.get("suspicious"):
                 result["suspicious"] = True
 
@@ -959,83 +667,148 @@ def enrich_url(
 
     if "malicious" in reputations:
         result["reputation"] = "malicious"
-
     elif "suspicious" in reputations:
         result["reputation"] = "suspicious"
-
     elif reputations:
         result["reputation"] = reputations[0]
 
     result["providers"] = providers
+    return result
+
+
+async def _limited_call(function, *args, **kwargs):
+    async with _TI_LIMITER:
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+
+def _unique_normalized(values: list[str], normalizer) -> list[str]:
+    result = []
+    seen = set()
+
+    for value in values:
+        normalized = normalizer(value)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# Bulk IOC Enrichment
-# ---------------------------------------------------------------------------
+async def enrich_ip_async(
+    ip: str,
+    *,
+    use_abuseipdb: bool = True,
+    use_virustotal: bool = True,
+) -> dict[str, Any]:
+    normalized = normalize_ip(ip)
+
+    if not normalized:
+        result = empty_ip_result(ip)
+        result["errors"].append("Invalid IP address")
+        return result
+
+    if not is_public_ip(normalized):
+        result = empty_ip_result(ip)
+        result["errors"].append("IP is not globally routable")
+        return result
+
+    tasks = []
+
+    if use_abuseipdb:
+        tasks.append(
+            ("abuseipdb", _limited_call(check_abuseipdb, normalized))
+        )
+
+    if use_virustotal:
+        tasks.append(
+            ("virustotal", _limited_call(check_virustotal_ip, normalized))
+        )
+
+    if not tasks:
+        return empty_ip_result(normalized)
+
+    names = [name for name, _ in tasks]
+    results = await asyncio.gather(
+        *(task for _, task in tasks)
+    )
+
+    return _merge_ip_provider_results(
+        normalized,
+        dict(zip(names, results)),
+    )
 
 
-def enrich_iocs(
+async def enrich_domain_async(
+    domain: str,
+    *,
+    use_virustotal: bool = True,
+) -> dict[str, Any]:
+    normalized = normalize_domain(domain)
+
+    if not normalized:
+        result = empty_domain_result(domain)
+        result["errors"].append("Invalid domain")
+        return result
+
+    if not use_virustotal:
+        return empty_domain_result(normalized)
+
+    return await _limited_call(
+        enrich_domain,
+        normalized,
+        use_virustotal=True,
+    )
+
+
+async def enrich_url_async(
+    url: str,
+    *,
+    use_virustotal: bool = True,
+) -> dict[str, Any]:
+    normalized = normalize_url(url)
+
+    if not normalized:
+        result = empty_url_result(url)
+        result["errors"].append("Invalid HTTP/HTTPS URL")
+        return result
+
+    if not use_virustotal:
+        return empty_url_result(normalized)
+
+    return await _limited_call(
+        enrich_url,
+        normalized,
+        use_virustotal=True,
+    )
+
+
+async def enrich_iocs_async(
     *,
     ips: list[str] | None = None,
     domains: list[str] | None = None,
     urls: list[str] | None = None,
 ) -> dict[str, Any]:
-    """
-    Enrich multiple IOCs.
+    unique_ips = _unique_normalized(ips or [], normalize_ip)
+    unique_domains = _unique_normalized(domains or [], normalize_domain)
+    unique_urls = _unique_normalized(urls or [], normalize_url)
 
-    This function is intentionally synchronous for the initial MVP.
-    Later, this can be moved to async/background workers to avoid
-    slowing down the HTTP request.
-    """
-    ips = ips or []
-    domains = domains or []
-    urls = urls or []
-
-    ip_results = []
-    domain_results = []
-    url_results = []
-
-    # De-duplicate while preserving order.
-    unique_ips = list(
-        dict.fromkeys(
-            normalize_ip(ip)
-            for ip in ips
-            if normalize_ip(ip)
-        )
+    ip_results, domain_results, url_results = await asyncio.gather(
+        asyncio.gather(
+            *(enrich_ip_async(ip) for ip in unique_ips)
+        ),
+        asyncio.gather(
+            *(enrich_domain_async(domain) for domain in unique_domains)
+        ),
+        asyncio.gather(
+            *(enrich_url_async(url) for url in unique_urls)
+        ),
     )
 
-    unique_domains = list(
-        dict.fromkeys(
-            normalize_domain(domain)
-            for domain in domains
-            if normalize_domain(domain)
-        )
+    all_results = (
+        list(ip_results)
+        + list(domain_results)
+        + list(url_results)
     )
-
-    unique_urls = list(
-        dict.fromkeys(
-            normalize_url(url)
-            for url in urls
-            if normalize_url(url)
-        )
-    )
-
-    for ip in unique_ips:
-        ip_results.append(
-            enrich_ip(ip)
-        )
-
-    for domain in unique_domains:
-        domain_results.append(
-            enrich_domain(domain)
-        )
-
-    for url in unique_urls:
-        url_results.append(
-            enrich_url(url)
-        )
 
     return {
         "analyzed_at": utc_now(),
@@ -1045,23 +818,74 @@ def enrich_iocs(
             "urls": len(url_results),
             "malicious": sum(
                 1
-                for item in (
-                    ip_results
-                    + domain_results
-                    + url_results
+                for item in all_results
+                if (
+                    item.get("reputation") == "malicious"
+                    or item.get("malicious") is True
                 )
-                if item.get("reputation") == "malicious"
-                or item.get("malicious") is True
             ),
             "suspicious": sum(
                 1
-                for item in (
-                    ip_results
-                    + domain_results
-                    + url_results
+                for item in all_results
+                if (
+                    item.get("reputation") == "suspicious"
+                    or item.get("suspicious") is True
                 )
-                if item.get("reputation") == "suspicious"
-                or item.get("suspicious") is True
+            ),
+        },
+        "ips": list(ip_results),
+        "domains": list(domain_results),
+        "urls": list(url_results),
+    }
+
+
+def enrich_iocs(
+    *,
+    ips: list[str] | None = None,
+    domains: list[str] | None = None,
+    urls: list[str] | None = None,
+) -> dict[str, Any]:
+    unique_ips = _unique_normalized(ips or [], normalize_ip)
+    unique_domains = _unique_normalized(domains or [], normalize_domain)
+    unique_urls = _unique_normalized(urls or [], normalize_url)
+
+    ip_results = [enrich_ip(ip) for ip in unique_ips]
+    domain_results = [
+        enrich_domain(domain)
+        for domain in unique_domains
+    ]
+    url_results = [
+        enrich_url(url)
+        for url in unique_urls
+    ]
+
+    all_results = (
+        ip_results
+        + domain_results
+        + url_results
+    )
+
+    return {
+        "analyzed_at": utc_now(),
+        "summary": {
+            "ips": len(ip_results),
+            "domains": len(domain_results),
+            "urls": len(url_results),
+            "malicious": sum(
+                1
+                for item in all_results
+                if (
+                    item.get("reputation") == "malicious"
+                    or item.get("malicious") is True
+                )
+            ),
+            "suspicious": sum(
+                1
+                for item in all_results
+                if (
+                    item.get("reputation") == "suspicious"
+                    or item.get("suspicious") is True
+                )
             ),
         },
         "ips": ip_results,
@@ -1070,31 +894,10 @@ def enrich_iocs(
     }
 
 
-# ---------------------------------------------------------------------------
-# Risk Engine Adapter
-# ---------------------------------------------------------------------------
-
-
 def build_infrastructure_signals(
     ti_results: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """
-    Convert TI results into normalized infrastructure signals.
-
-    This output is compatible with the risk-engine concept:
-
-        threat_score
-        reputation
-        TOR
-        VPN
-        open relay
-        etc.
-
-    Important:
-        These signals indicate infrastructure risk.
-        They do NOT prove attacker identity or physical location.
-    """
-    signals: list[dict[str, Any]] = []
+    signals = []
 
     all_results = (
         ti_results.get("ips", [])
@@ -1103,18 +906,10 @@ def build_infrastructure_signals(
     )
 
     for result in all_results:
-
         indicator = result.get("indicator")
         indicator_type = result.get("indicator_type")
-
-        threat_score = int(
-            result.get("threat_score") or 0
-        )
-
-        reputation = result.get(
-            "reputation",
-            "unknown",
-        )
+        threat_score = int(result.get("threat_score") or 0)
+        reputation = result.get("reputation", "unknown")
 
         if threat_score >= 80:
             signals.append(
@@ -1134,7 +929,6 @@ def build_infrastructure_signals(
                     },
                 }
             )
-
         elif threat_score >= 60:
             signals.append(
                 {
@@ -1170,7 +964,6 @@ def build_infrastructure_signals(
                     },
                 }
             )
-
         elif reputation == "suspicious":
             signals.append(
                 {
@@ -1225,17 +1018,7 @@ def build_infrastructure_signals(
     return signals
 
 
-# ---------------------------------------------------------------------------
-# Health / Configuration
-# ---------------------------------------------------------------------------
-
-
 def get_threat_intel_status() -> dict[str, Any]:
-    """
-    Return configured TI providers.
-
-    API keys themselves are never returned.
-    """
     return {
         "service": "threat_intelligence",
         "status": "ready",
@@ -1247,12 +1030,11 @@ def get_threat_intel_status() -> dict[str, Any]:
                 "configured": bool(VIRUSTOTAL_API_KEY),
             },
         },
+        "concurrency": TI_CONCURRENCY,
     }
 
 
-# ---------------------------------------------------------------------------
-# Public exports
-# ---------------------------------------------------------------------------
+_TI_LIMITER = asyncio.Semaphore(TI_CONCURRENCY)
 
 
 __all__ = [
@@ -1266,6 +1048,10 @@ __all__ = [
     "enrich_domain",
     "enrich_url",
     "enrich_iocs",
+    "enrich_ip_async",
+    "enrich_domain_async",
+    "enrich_url_async",
+    "enrich_iocs_async",
     "build_infrastructure_signals",
     "get_threat_intel_status",
 ]

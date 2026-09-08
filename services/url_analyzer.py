@@ -44,10 +44,6 @@ from urllib.parse import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 MAX_URL_LENGTH = 4096
 
 SUSPICIOUS_PORTS = {
@@ -155,31 +151,10 @@ SHORTENER_DOMAINS = {
     "tiny.one",
 }
 
-DANGEROUS_SCHEMES = {
-    "javascript",
-    "data",
-    "vbscript",
-    "file",
-}
-
 URL_PATTERN = re.compile(
     r"https?://[^\s<>'\"`]+",
     re.IGNORECASE,
 )
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class URLAnalyzerError(Exception):
-    """Base exception for URL analyzer errors."""
-
-
-# ---------------------------------------------------------------------------
-# Basic Utilities
-# ---------------------------------------------------------------------------
 
 
 def normalize_url(url: str) -> str | None:
@@ -218,28 +193,6 @@ def normalize_url(url: str) -> str | None:
     return url
 
 
-def is_valid_url(url: str) -> bool:
-    """
-    Check whether a URL is syntactically valid for analysis.
-    """
-
-    normalized = normalize_url(url)
-
-    if not normalized:
-        return False
-
-    try:
-        parsed = urlparse(normalized)
-
-        return bool(
-            parsed.scheme
-            and parsed.hostname
-        )
-
-    except Exception:
-        return False
-
-
 def extract_urls(text: str) -> list[str]:
     """
     Extract HTTP/HTTPS URLs from text.
@@ -260,11 +213,6 @@ def extract_urls(text: str) -> list[str]:
             urls.append(normalized)
 
     return urls
-
-
-# ---------------------------------------------------------------------------
-# URL Parsing
-# ---------------------------------------------------------------------------
 
 
 def parse_url(url: str) -> dict[str, Any]:
@@ -327,11 +275,6 @@ def parse_url(url: str) -> dict[str, Any]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# IP Detection
-# ---------------------------------------------------------------------------
-
-
 def hostname_is_ip(hostname: str | None) -> bool:
     """
     Determine whether a hostname is an IPv4/IPv6 address.
@@ -378,11 +321,6 @@ def classify_host(hostname: str | None) -> str:
         return "ip"
 
     return "domain"
-
-
-# ---------------------------------------------------------------------------
-# Encoding / Obfuscation
-# ---------------------------------------------------------------------------
 
 
 def count_percent_encoded(url: str) -> int:
@@ -503,13 +441,7 @@ def analyze_encoding(
             decoded_once
             if changed_after_decode
             else None,
-        "base64_like_query_values": [],
     }
-
-
-# ---------------------------------------------------------------------------
-# Hostname Analysis
-# ---------------------------------------------------------------------------
 
 
 def analyze_hostname(
@@ -579,11 +511,6 @@ def analyze_hostname(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Path Analysis
-# ---------------------------------------------------------------------------
-
-
 def analyze_path(
     path: str | None,
 ) -> dict[str, Any]:
@@ -620,11 +547,6 @@ def analyze_path(
         ),
         "suspicious_keywords": keywords,
     }
-
-
-# ---------------------------------------------------------------------------
-# Query Analysis
-# ---------------------------------------------------------------------------
 
 
 def analyze_query(
@@ -679,11 +601,6 @@ def analyze_query(
     }
 
 
-# ---------------------------------------------------------------------------
-# Credential / Userinfo Analysis
-# ---------------------------------------------------------------------------
-
-
 def analyze_userinfo(
     parsed: dict[str, Any],
 ) -> dict[str, Any]:
@@ -715,11 +632,6 @@ def analyze_userinfo(
     }
 
 
-# ---------------------------------------------------------------------------
-# Shortener Detection
-# ---------------------------------------------------------------------------
-
-
 def is_url_shortener(
     hostname: str | None,
 ) -> bool:
@@ -733,11 +645,6 @@ def is_url_shortener(
     hostname = hostname.lower().rstrip(".")
 
     return hostname in SHORTENER_DOMAINS
-
-
-# ---------------------------------------------------------------------------
-# Redirect / Destination Indicators
-# ---------------------------------------------------------------------------
 
 
 def detect_redirect_parameters(
@@ -768,11 +675,6 @@ def detect_redirect_parameters(
         for key in parameters
         if key.lower() in redirect_keys
     ]
-
-
-# ---------------------------------------------------------------------------
-# URL Signals
-# ---------------------------------------------------------------------------
 
 
 def build_url_signals(
@@ -833,10 +735,6 @@ def build_url_signals(
         {}
     )
 
-    # -----------------------------------------------------------------------
-    # IP-based URL
-    # -----------------------------------------------------------------------
-
     if host_analysis.get(
         "host_type"
     ) == "public_ip":
@@ -856,10 +754,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # Private IP
-    # -----------------------------------------------------------------------
-
     if host_analysis.get(
         "host_type"
     ) == "private_ip":
@@ -878,10 +772,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # HTTP
-    # -----------------------------------------------------------------------
-
     if scheme == "http":
 
         signals.append(
@@ -896,10 +786,6 @@ def build_url_signals(
                 },
             }
         )
-
-    # -----------------------------------------------------------------------
-    # Suspicious port
-    # -----------------------------------------------------------------------
 
     if port in SUSPICIOUS_PORTS:
 
@@ -917,10 +803,6 @@ def build_url_signals(
                 },
             }
         )
-
-    # -----------------------------------------------------------------------
-    # URL credentials
-    # -----------------------------------------------------------------------
 
     if userinfo_analysis.get(
         "password_present"
@@ -945,10 +827,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # URL shortener
-    # -----------------------------------------------------------------------
-
     if is_url_shortener(hostname):
 
         signals.append(
@@ -965,10 +843,6 @@ def build_url_signals(
                 },
             }
         )
-
-    # -----------------------------------------------------------------------
-    # Suspicious TLD
-    # -----------------------------------------------------------------------
 
     if host_analysis.get(
         "suspicious_tld"
@@ -994,10 +868,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # Suspicious hostname keywords
-    # -----------------------------------------------------------------------
-
     hostname_keywords = host_analysis.get(
         "suspicious_keywords",
         []
@@ -1022,10 +892,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # Deep subdomain
-    # -----------------------------------------------------------------------
-
     if host_analysis.get(
         "subdomain_depth",
         0,
@@ -1049,10 +915,6 @@ def build_url_signals(
                 },
             }
         )
-
-    # -----------------------------------------------------------------------
-    # Suspicious path keywords
-    # -----------------------------------------------------------------------
 
     path_keywords = path_analysis.get(
         "suspicious_keywords",
@@ -1080,10 +942,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # Suspicious query parameters
-    # -----------------------------------------------------------------------
-
     suspicious_keys = query_analysis.get(
         "suspicious_keys",
         []
@@ -1107,10 +965,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # Redirect parameters
-    # -----------------------------------------------------------------------
-
     redirect_keys = detect_redirect_parameters(
         query_analysis
     )
@@ -1131,10 +985,6 @@ def build_url_signals(
                 },
             }
         )
-
-    # -----------------------------------------------------------------------
-    # Encoding
-    # -----------------------------------------------------------------------
 
     encoded_count = encoding_analysis.get(
         "percent_encoded_count",
@@ -1176,10 +1026,6 @@ def build_url_signals(
             }
         )
 
-    # -----------------------------------------------------------------------
-    # Base64-like query value
-    # -----------------------------------------------------------------------
-
     base64_values = query_analysis.get(
         "base64_like_values",
         []
@@ -1203,11 +1049,6 @@ def build_url_signals(
         )
 
     return signals
-
-
-# ---------------------------------------------------------------------------
-# Complete URL Analysis
-# ---------------------------------------------------------------------------
 
 
 def analyze_url(
@@ -1303,11 +1144,6 @@ def analyze_url(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Bulk URL Analysis
-# ---------------------------------------------------------------------------
-
-
 def analyze_urls(
     urls: list[str],
 ) -> list[dict[str, Any]]:
@@ -1341,11 +1177,6 @@ def analyze_urls(
         )
 
     return results
-
-
-# ---------------------------------------------------------------------------
-# Extract Risk Signals
-# ---------------------------------------------------------------------------
 
 
 def build_url_risk_signals(
@@ -1393,11 +1224,6 @@ def build_url_risk_signals(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Service Status
-# ---------------------------------------------------------------------------
-
-
 def get_url_analyzer_status() -> dict[str, Any]:
     """
     Return URL analyzer capabilities.
@@ -1425,15 +1251,8 @@ def get_url_analyzer_status() -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 __all__ = [
-    "URLAnalyzerError",
     "normalize_url",
-    "is_valid_url",
     "extract_urls",
     "parse_url",
     "hostname_is_ip",
