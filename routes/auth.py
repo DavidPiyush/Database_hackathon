@@ -2,6 +2,7 @@ import json
 import os
 import secrets
 from pathlib import Path
+import requests
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse
@@ -46,6 +47,11 @@ GOOGLE_REDIRECT_URI = os.getenv(
     "http://127.0.0.1:8000/auth/google/callback",
 )
 
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:3000",
+).rstrip("/")
+
 
 # ============================================================
 # GOOGLE SCOPES
@@ -61,19 +67,6 @@ SCOPES = [
 
 # ============================================================
 # TOKEN STORAGE
-# ============================================================
-#
-# Development storage:
-#
-# backend/
-# ├── token.json
-# ├── main.py
-# ├── routes/
-# └── services/
-#
-# IMPORTANT:
-# token.json MUST be in .gitignore.
-#
 # ============================================================
 
 TOKEN_FILE = (
@@ -101,14 +94,11 @@ def save_google_token(
     """
     Save Google OAuth credentials to token.json.
 
-    This is suitable for local development/hackathon use.
-
-    Production deployment should use encrypted or managed
-    secret/token storage instead.
+    Development/hackathon storage only.
+    Production should use secure user-specific storage.
     """
 
     try:
-
         TOKEN_FILE.write_text(
             json.dumps(
                 token_data,
@@ -118,7 +108,6 @@ def save_google_token(
         )
 
     except Exception as exc:
-
         raise RuntimeError(
             f"Unable to save Google token: {exc}"
         ) from exc
@@ -133,23 +122,18 @@ def load_google_token():
         return None
 
     try:
-
         data = json.loads(
             TOKEN_FILE.read_text(
                 encoding="utf-8",
             )
         )
 
-        if not isinstance(
-            data,
-            dict,
-        ):
+        if not isinstance(data, dict):
             return None
 
         return data
 
     except Exception:
-
         return None
 
 
@@ -164,12 +148,10 @@ def delete_google_token():
     )
 
     try:
-
         if TOKEN_FILE.exists():
             TOKEN_FILE.unlink()
 
     except Exception as exc:
-
         raise RuntimeError(
             f"Unable to delete Google token: {exc}"
         ) from exc
@@ -182,10 +164,7 @@ def delete_google_token():
 _saved_token = load_google_token()
 
 if _saved_token:
-
-    google_tokens["default"] = (
-        _saved_token
-    )
+    google_tokens["default"] = _saved_token
 
 
 # ============================================================
@@ -196,10 +175,7 @@ def create_google_flow(
     code_verifier: str | None = None,
 ):
     """
-    Create a Google OAuth Flow.
-
-    PKCE verifier is explicitly supplied when starting OAuth
-    and reused during the callback.
+    Create Google OAuth Flow.
     """
 
     if not GOOGLE_CLIENT_ID:
@@ -246,17 +222,12 @@ def token_data_to_credentials(
     token_data: dict,
 ) -> Credentials:
     """
-    Convert stored token information into a Google Credentials
-    object.
+    Convert stored token information into Google Credentials.
     """
 
     return Credentials(
-        token=token_data.get(
-            "token"
-        ),
-        refresh_token=token_data.get(
-            "refresh_token"
-        ),
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
         token_uri=token_data.get(
             "token_uri",
             "https://oauth2.googleapis.com/token",
@@ -288,20 +259,17 @@ def refresh_google_credentials(
     """
 
     if not credentials.refresh_token:
-
         raise RuntimeError(
             "Google access token expired and no refresh token "
             "is available. Please authenticate again."
         )
 
     try:
-
         credentials.refresh(
             Request()
         )
 
     except Exception as exc:
-
         raise RuntimeError(
             f"Google token refresh failed: {exc}"
         ) from exc
@@ -315,9 +283,7 @@ def refresh_google_credentials(
         "scopes": credentials.scopes,
     }
 
-    google_tokens["default"] = (
-        token_data
-    )
+    google_tokens["default"] = token_data
 
     save_google_token(
         token_data
@@ -333,13 +299,6 @@ def refresh_google_credentials(
 def get_google_credentials() -> Credentials:
     """
     Return valid Google OAuth credentials.
-
-    Behavior:
-
-        1. Load credentials from memory.
-        2. Load from token.json if necessary.
-        3. Refresh expired credentials.
-        4. Return valid credentials.
     """
 
     token_data = google_tokens.get(
@@ -347,45 +306,26 @@ def get_google_credentials() -> Credentials:
     )
 
     if not token_data:
-
         token_data = load_google_token()
 
         if token_data:
-
-            google_tokens["default"] = (
-                token_data
-            )
+            google_tokens["default"] = token_data
 
     if not token_data:
-
         raise RuntimeError(
             "Google authentication required."
         )
 
-    credentials = (
-        token_data_to_credentials(
-            token_data
-        )
+    credentials = token_data_to_credentials(
+        token_data
     )
 
-    # --------------------------------------------------------
-    # Refresh expired credentials
-    # --------------------------------------------------------
-
     if credentials.expired:
-
-        credentials = (
-            refresh_google_credentials(
-                credentials
-            )
+        credentials = refresh_google_credentials(
+            credentials
         )
 
-    # --------------------------------------------------------
-    # Make sure an access token exists
-    # --------------------------------------------------------
-
     if not credentials.token:
-
         raise RuntimeError(
             "Google access token is unavailable."
         )
@@ -406,8 +346,8 @@ async def google_login():
         # Generate PKCE verifier
         # ----------------------------------------------------
 
-        code_verifier = (
-            secrets.token_urlsafe(64)
+        code_verifier = secrets.token_urlsafe(
+            64
         )
 
         flow = create_google_flow(
@@ -452,9 +392,7 @@ async def google_login():
 # GOOGLE CALLBACK
 # ============================================================
 
-@router.get(
-    "/google/callback"
-)
+@router.get("/google/callback")
 async def google_callback(
     code: str,
     state: str,
@@ -493,7 +431,7 @@ async def google_callback(
             )
 
         # ----------------------------------------------------
-        # Recreate flow with same verifier
+        # Recreate OAuth flow
         # ----------------------------------------------------
 
         flow = create_google_flow(
@@ -508,9 +446,7 @@ async def google_callback(
             code=code
         )
 
-        credentials = (
-            flow.credentials
-        )
+        credentials = flow.credentials
 
         if not credentials.token:
 
@@ -529,9 +465,6 @@ async def google_callback(
             credentials.refresh_token
         )
 
-        # If Google doesn't return a new refresh token,
-        # preserve the existing one if available.
-
         old_token = google_tokens.get(
             "default"
         )
@@ -540,11 +473,8 @@ async def google_callback(
             not refresh_token
             and old_token
         ):
-
-            refresh_token = (
-                old_token.get(
-                    "refresh_token"
-                )
+            refresh_token = old_token.get(
+                "refresh_token"
             )
 
         # ----------------------------------------------------
@@ -561,16 +491,10 @@ async def google_callback(
         }
 
         # ----------------------------------------------------
-        # Store in memory
+        # Store Google credentials
         # ----------------------------------------------------
 
-        google_tokens["default"] = (
-            token_data
-        )
-
-        # ----------------------------------------------------
-        # Store on disk
-        # ----------------------------------------------------
+        google_tokens["default"] = token_data
 
         save_google_token(
             token_data
@@ -585,18 +509,19 @@ async def google_callback(
             None,
         )
 
-        return {
-            "message": (
-                "Google authentication successful."
-            ),
-            "has_access_token": bool(
-                credentials.token
-            ),
-            "has_refresh_token": bool(
-                refresh_token
-            ),
-            "scopes": credentials.scopes,
-        }
+        # ----------------------------------------------------
+        # Redirect to Next.js session callback
+        # ----------------------------------------------------
+
+        session_callback_url = (
+            f"{FRONTEND_URL}"
+            "/api/auth/google/callback"
+        )
+
+        return RedirectResponse(
+            url=session_callback_url,
+            status_code=302,
+        )
 
     except HTTPException:
         raise
@@ -623,49 +548,93 @@ async def authentication_status():
     )
 
     if not token_data:
-
         token_data = load_google_token()
 
         if token_data:
-
-            google_tokens["default"] = (
-                token_data
-            )
+            google_tokens["default"] = token_data
 
     if not token_data:
-
         return {
             "authenticated": False,
-            "has_access_token": False,
-            "has_refresh_token": False,
+            "user": None,
         }
 
     try:
 
-        credentials = (
-            token_data_to_credentials(
-                token_data
-            )
+        credentials = token_data_to_credentials(
+            token_data
         )
 
         if credentials.expired:
-
-            credentials = (
-                refresh_google_credentials(
-                    credentials
-                )
+            credentials = refresh_google_credentials(
+                credentials
             )
 
+        if not credentials.token:
+            return {
+                "authenticated": False,
+                "user": None,
+            }
+
+        # ----------------------------------------------------
+        # Fetch authenticated Google profile
+        # ----------------------------------------------------
+
+        response = requests.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={
+                "Authorization": (
+                    f"Bearer {credentials.token}"
+                ),
+            },
+            timeout=10,
+        )
+
+        if not response.ok:
+            return {
+                "authenticated": False,
+                "user": None,
+                "error": (
+                    "Unable to retrieve Google profile."
+                ),
+            }
+
+        profile = response.json()
+
+        # ----------------------------------------------------
+        # Normalize Google user
+        # ----------------------------------------------------
+
+        user = {
+            "id": profile.get("sub"),
+            "name": profile.get("name"),
+            "email": profile.get("email"),
+            "picture": profile.get("picture"),
+            "given_name": profile.get("given_name"),
+            "family_name": profile.get("family_name"),
+            "email_verified": profile.get(
+                "email_verified",
+                False,
+            ),
+            "role": "analyst",
+        }
+
+        # ----------------------------------------------------
+        # Validate Google identity
+        # ----------------------------------------------------
+
+        if not user["id"]:
+            return {
+                "authenticated": False,
+                "user": None,
+                "error": (
+                    "Google account ID was not returned."
+                ),
+            }
+
         return {
-            "authenticated": bool(
-                credentials.token
-            ),
-            "has_access_token": bool(
-                credentials.token
-            ),
-            "has_refresh_token": bool(
-                credentials.refresh_token
-            ),
+            "authenticated": True,
+            "user": user,
             "scopes": credentials.scopes,
         }
 
@@ -673,12 +642,7 @@ async def authentication_status():
 
         return {
             "authenticated": False,
-            "has_access_token": False,
-            "has_refresh_token": bool(
-                token_data.get(
-                    "refresh_token"
-                )
-            ),
+            "user": None,
             "error": str(exc),
         }
 

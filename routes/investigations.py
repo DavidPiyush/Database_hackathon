@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 
 from models.investigation import (
     InvestigationCreate,
@@ -6,6 +6,7 @@ from models.investigation import (
 )
 
 from services.investigation_services import InvestigationService
+
 from services.gmail_services import (
     GmailService,
     GmailServiceError,
@@ -25,7 +26,9 @@ router = APIRouter(
 # ============================================================
 
 @router.post("")
-async def create_investigation(request: InvestigationCreate):
+async def create_investigation(
+    request: InvestigationCreate,
+):
     """
     Create a new investigation case.
     """
@@ -62,34 +65,23 @@ async def create_investigation(request: InvestigationCreate):
 # ============================================================
 
 @router.get("")
-async def list_investigations(
-    status: str | None = Query(default=None),
-    priority: str | None = Query(default=None),
-    analyst: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-):
+async def list_investigations():
     """
-    List investigation cases.
+    List all investigation cases.
 
-    Supports optional filtering by:
-    - status
-    - priority
-    - analyst
+    The current InvestigationService.list_investigations()
+    implementation does not accept filters or pagination
+    parameters, so this route intentionally calls it without
+    arguments and wraps the returned list in an API response.
     """
 
     try:
-        result = InvestigationService.list_investigations(
-            status=status,
-            priority=priority,
-            analyst=analyst,
-            limit=limit,
-            offset=offset,
-        )
+        result = InvestigationService.list_investigations()
 
         return {
             "success": True,
-            **result,
+            "investigations": result,
+            "count": len(result),
         }
 
     except ValueError as exc:
@@ -110,9 +102,11 @@ async def list_investigations(
 # ============================================================
 
 @router.get("/{case_id}")
-async def get_investigation(case_id: str):
+async def get_investigation(
+    case_id: str,
+):
     """
-    Get complete investigation including:
+    Get a complete investigation including:
 
     - case metadata
     - analyzed emails
@@ -122,7 +116,7 @@ async def get_investigation(case_id: str):
     """
 
     try:
-        result = InvestigationService.get_complete_investigation(
+        result = InvestigationService.get_investigation(
             case_id
         )
 
@@ -140,10 +134,16 @@ async def get_investigation(case_id: str):
     except HTTPException:
         raise
 
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to retrieve investigation: {exc}",
+            detail=f"Failed to get investigation: {exc}",
         )
 
 
@@ -157,31 +157,18 @@ async def update_investigation(
     request: InvestigationUpdate,
 ):
     """
-    Update investigation metadata.
-
-    Possible fields:
-    - title
-    - description
-    - priority
-    - status
-    - analyst
-    - notes
+    Update an existing investigation case.
     """
 
     try:
-        update_data = request.model_dump(
-            exclude_unset=True
-        )
-
-        if not update_data:
-            raise HTTPException(
-                status_code=400,
-                detail="No fields provided for update",
-            )
-
         result = InvestigationService.update_investigation(
-            case_id=case_id,
-            **update_data,
+            case_id,
+            title=request.title,
+            description=request.description,
+            priority=request.priority,
+            status=request.status,
+            analyst=request.analyst,
+            notes=request.notes,
         )
 
         if not result:
@@ -213,240 +200,23 @@ async def update_investigation(
 
 
 # ============================================================
-# ANALYZE GMAIL MESSAGE INSIDE CASE
-# ============================================================
-
-@router.post(
-    "/{case_id}/analyze-gmail/{message_id}"
-)
-async def analyze_gmail_message(
-    case_id: str,
-    message_id: str,
-):
-    """
-    Fetch a Gmail message as raw RFC 5322 email,
-    analyze it and persist the complete result
-    into the investigation.
-    """
-
-    # --------------------------------------------------------
-    # Verify investigation exists
-    # --------------------------------------------------------
-
-    try:
-        investigation = InvestigationService.get_investigation(
-            case_id
-        )
-
-        if not investigation:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Investigation '{case_id}' not found",
-            )
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to verify investigation: {exc}",
-        )
-
-    # --------------------------------------------------------
-    # Fetch Gmail message
-    # --------------------------------------------------------
-
-    try:
-        gmail = GmailService()
-
-        raw_email = gmail.get_raw_message(
-            message_id
-        )
-
-    except GmailServiceError as exc:
-        raise HTTPException(
-            status_code=401,
-            detail=str(exc),
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to retrieve Gmail message: {exc}",
-        )
-
-    # --------------------------------------------------------
-    # Analyze email
-    # --------------------------------------------------------
-
-    try:
-        analysis_result = _analyze_raw_email(
-            raw_email=raw_email,
-            gmail_message_id=message_id,
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Email analysis failed: {exc}",
-        )
-
-    # --------------------------------------------------------
-    # Persist analysis atomically
-    # --------------------------------------------------------
-
-    try:
-        saved_result = InvestigationService.save_analysis(
-            case_id=case_id,
-            analysis=analysis_result,
-            gmail_message_id=message_id,
-        )
-
-        return {
-            "success": True,
-            "message": "Gmail message analyzed and saved",
-            "data": saved_result,
-        }
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save analysis: {exc}",
-        )
-
-
-# ============================================================
-# GET FINDINGS
-# ============================================================
-
-@router.get("/{case_id}/findings")
-async def get_findings(
-    case_id: str,
-    severity: str | None = Query(default=None),
-    finding_type: str | None = Query(default=None),
-):
-    """
-    Retrieve findings belonging to an investigation.
-    """
-
-    try:
-        investigation = InvestigationService.get_investigation(
-            case_id
-        )
-
-        if not investigation:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Investigation '{case_id}' not found",
-            )
-
-        findings = InvestigationService.get_findings(
-            case_id=case_id,
-            severity=severity,
-            finding_type=finding_type,
-        )
-
-        return {
-            "success": True,
-            "case_id": case_id,
-            "count": len(findings),
-            "findings": findings,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to retrieve findings: {exc}",
-        )
-
-
-# ============================================================
-# GET IOCs
-# ============================================================
-
-@router.get("/{case_id}/iocs")
-async def get_iocs(
-    case_id: str,
-    ioc_type: str | None = Query(default=None),
-):
-    """
-    Retrieve IOCs associated with an investigation.
-    """
-
-    try:
-        investigation = InvestigationService.get_investigation(
-            case_id
-        )
-
-        if not investigation:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Investigation '{case_id}' not found",
-            )
-
-        iocs = InvestigationService.get_iocs(
-            case_id=case_id,
-            ioc_type=ioc_type,
-        )
-
-        return {
-            "success": True,
-            "case_id": case_id,
-            "count": len(iocs),
-            "iocs": iocs,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to retrieve IOCs: {exc}",
-        )
-
-
-# ============================================================
 # DELETE INVESTIGATION
 # ============================================================
 
 @router.delete("/{case_id}")
-async def delete_investigation(case_id: str):
+async def delete_investigation(
+    case_id: str,
+):
     """
-    Delete an investigation and its dependent data.
-
-    PostgreSQL foreign keys with ON DELETE CASCADE
-    remove associated emails, findings and IOCs.
+    Delete an investigation case.
     """
 
     try:
-        deleted = InvestigationService.delete_investigation(
+        result = InvestigationService.delete_investigation(
             case_id
         )
 
-        if not deleted:
+        if not result:
             raise HTTPException(
                 status_code=404,
                 detail=f"Investigation '{case_id}' not found",
@@ -461,8 +231,98 @@ async def delete_investigation(case_id: str):
     except HTTPException:
         raise
 
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to delete investigation: {exc}",
+        )
+
+
+# ============================================================
+# ANALYZE GMAIL MESSAGE INSIDE INVESTIGATION
+# ============================================================
+
+@router.post("/{case_id}/gmail/{message_id}/analyze")
+async def analyze_gmail_message_for_investigation(
+    case_id: str,
+    message_id: str,
+):
+    """
+    Fetch a Gmail message, analyze it using the existing
+    email analysis pipeline, and associate the analysis
+    with an investigation.
+
+    This uses the existing Gmail service and analysis engine.
+    """
+
+    try:
+        investigation = InvestigationService.get_investigation(
+            case_id
+        )
+
+        if not investigation:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Investigation '{case_id}' not found",
+            )
+
+        gmail = GmailService()
+
+        raw_email = gmail.get_raw_message(
+            message_id
+        )
+
+        if not raw_email:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Gmail message '{message_id}' not found",
+            )
+
+        result = _analyze_raw_email(
+            raw_email
+        )
+
+        result["gmail"] = {
+            "message_id": message_id,
+        }
+
+        result["investigation"] = {
+            "case_id": case_id,
+        }
+
+        return {
+            "success": True,
+            "case_id": case_id,
+            "message_id": message_id,
+            "analysis": result,
+        }
+
+    except HTTPException:
+        raise
+
+    except GmailServiceError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail service error: {exc}",
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to analyze Gmail message "
+                f"for investigation: {exc}"
+            ),
         )
