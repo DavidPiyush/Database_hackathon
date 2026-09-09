@@ -13,6 +13,7 @@ from services.domain_intelligence import analyze_domains
 from services.url_analyzer import analyze_urls
 from services.threat_intel import enrich_iocs_async
 from services.risk_engine import calculate_risk
+from AI_ENGINE.pipeline import analyze_ai
 
 
 router = APIRouter(
@@ -400,6 +401,48 @@ async def _analyze_raw_email(
         raw_email,
     )
 
+    # --------------------------------------------------------
+    # AI / ML evidence
+    # --------------------------------------------------------
+    # AI receives the normalized content produced by the parser.
+    # It does not replace authentication, infrastructure, TI, or
+    # the deterministic final risk engine.
+    ai_input = {
+        "subject": parsed.get("subject", ""),
+        "body": parsed.get("body", ""),
+        "sender": (
+            parsed.get("sender")
+            or parsed.get("sender_email")
+            or (parsed.get("identity") or {}).get("sender_email")
+            or ""
+        ),
+        "recipient": (
+            parsed.get("recipient")
+            or parsed.get("to")
+            or parsed.get("recipient_email")
+            or ""
+        ),
+        "urls": parsed.get("urls") or [],
+        "ips": parsed.get("ips") or [],
+    }
+
+    try:
+        ai_result = await asyncio.to_thread(
+            analyze_ai,
+            ai_input,
+        )
+    except Exception as exc:
+        # AI failure must not take down the existing forensic pipeline.
+        ai_result = {
+            "model_results": [],
+            "metadata": {
+                "engine": "ThreatDetect AI_ENGINE",
+                "engine_version": "1.0.0",
+                "status": "error",
+                "error": str(exc),
+            },
+        }
+
     authentication = _get_authentication(parsed)
     identity = _build_identity_analysis(parsed)
     behavior = _analyze_behavior(parsed)
@@ -459,6 +502,8 @@ async def _analyze_raw_email(
         "behavioral_analysis": behavior,
         "infrastructure": infrastructure,
         "threat_intelligence": threat_intelligence,
+        "model_results": ai_result.get("model_results", []),
+        "ai": ai_result,
         "findings": findings,
         "risk": risk,
     }
@@ -529,6 +574,7 @@ async def analysis_status():
             "ip_intelligence",
             "threat_intelligence",
             "risk_engine",
+            "AI_ENGINE",
         ],
         "status": "ready",
     }

@@ -4,6 +4,8 @@ import os
 import secrets
 from pathlib import Path
 
+import httpx
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
@@ -34,13 +36,9 @@ router = APIRouter(
 # GOOGLE CONFIGURATION
 # ============================================================
 
-GOOGLE_CLIENT_ID = os.getenv(
-    "GOOGLE_CLIENT_ID"
-)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
-GOOGLE_CLIENT_SECRET = os.getenv(
-    "GOOGLE_CLIENT_SECRET"
-)
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
 GOOGLE_REDIRECT_URI = os.getenv(
     "GOOGLE_REDIRECT_URI",
@@ -83,8 +81,8 @@ google_tokens = {}
 
 oauth_sessions = {}
 
-# Prevent duplicate OAuth callbacks from exchanging the same one-time
-# Google authorization code concurrently in the same process.
+# Prevent duplicate OAuth callbacks from exchanging
+# the same one-time Google authorization code concurrently.
 oauth_callback_lock = asyncio.Lock()
 
 
@@ -184,12 +182,12 @@ def create_google_flow(
 
     if not GOOGLE_CLIENT_ID:
         raise RuntimeError(
-            "GOOGLE_CLIENT_ID is not configured in .env"
+            "GOOGLE_CLIENT_ID is not configured."
         )
 
     if not GOOGLE_CLIENT_SECRET:
         raise RuntimeError(
-            "GOOGLE_CLIENT_SECRET is not configured in .env"
+            "GOOGLE_CLIENT_SECRET is not configured."
         )
 
     client_config = {
@@ -386,9 +384,7 @@ async def google_login():
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Google login error: {exc}"
-            ),
+            detail=f"Google login error: {exc}",
         )
 
 
@@ -408,23 +404,41 @@ async def google_callback(
     )
 
     try:
-        # Google authorization codes are single-use. A browser/proxy can
-        # occasionally deliver the callback more than once. Serialize the
-        # callback so the same code is not exchanged concurrently.
+
+        # ----------------------------------------------------
+        # Serialize callback handling
+        # ----------------------------------------------------
+        #
+        # Google authorization codes are single-use.
+        # A duplicate browser/proxy request should not
+        # exchange the same code concurrently.
+        # ----------------------------------------------------
+
         async with oauth_callback_lock:
-            session = oauth_sessions.get(state)
+
+            session = oauth_sessions.get(
+                state
+            )
+
+            # ------------------------------------------------
+            # Duplicate callback
+            # ------------------------------------------------
 
             if not session:
-                # A duplicate callback can arrive after the first request has
-                # already consumed the OAuth state. If a valid Google token
-                # exists, the OAuth operation is already complete.
+
                 try:
-                    existing_credentials = get_google_credentials()
+
+                    existing_credentials = (
+                        get_google_credentials()
+                    )
+
                     if existing_credentials.token:
+
                         return RedirectResponse(
                             url=session_callback_url,
                             status_code=302,
                         )
+
                 except Exception:
                     pass
 
@@ -433,53 +447,116 @@ async def google_callback(
                     detail="Invalid or expired OAuth state.",
                 )
 
-            code_verifier = session.get("code_verifier")
+            # ------------------------------------------------
+            # Get PKCE verifier
+            # ------------------------------------------------
+
+            code_verifier = session.get(
+                "code_verifier"
+            )
 
             if not code_verifier:
-                oauth_sessions.pop(state, None)
+
+                oauth_sessions.pop(
+                    state,
+                    None,
+                )
+
                 raise HTTPException(
                     status_code=400,
                     detail="OAuth code verifier is missing.",
                 )
 
+            # ------------------------------------------------
+            # Create OAuth flow
+            # ------------------------------------------------
+
             flow = create_google_flow(
                 code_verifier=code_verifier
             )
 
+            # ------------------------------------------------
+            # Exchange authorization code
+            # ------------------------------------------------
+
             try:
-                flow.fetch_token(code=code)
+
+                flow.fetch_token(
+                    code=code
+                )
+
             except Exception as exc:
-                # Google authorization codes are one-time values. If another
-                # callback already exchanged this code, do not exchange it
-                # again; continue only when a valid token is already stored.
+
+                # Google authorization codes are single-use.
+                #
+                # If the same callback arrives twice and the
+                # first request already exchanged the code,
+                # Google may return invalid_grant.
+                #
+                # If a valid token is already available,
+                # continue to the frontend callback.
+
                 if "invalid_grant" in str(exc).lower():
-                    oauth_sessions.pop(state, None)
+
+                    oauth_sessions.pop(
+                        state,
+                        None,
+                    )
+
                     try:
-                        existing_credentials = get_google_credentials()
+
+                        existing_credentials = (
+                            get_google_credentials()
+                        )
+
                         if existing_credentials.token:
+
                             return RedirectResponse(
                                 url=session_callback_url,
                                 status_code=302,
                             )
+
                     except Exception:
                         pass
 
                 raise
 
+            # ------------------------------------------------
+            # Validate credentials
+            # ------------------------------------------------
+
             credentials = flow.credentials
 
             if not credentials.token:
-                oauth_sessions.pop(state, None)
+
+                oauth_sessions.pop(
+                    state,
+                    None,
+                )
+
                 raise HTTPException(
                     status_code=400,
                     detail="Google did not return an access token.",
                 )
 
+            # ------------------------------------------------
+            # Preserve refresh token
+            # ------------------------------------------------
+
             refresh_token = credentials.refresh_token
-            old_token = google_tokens.get("default")
+
+            old_token = google_tokens.get(
+                "default"
+            )
 
             if not refresh_token and old_token:
-                refresh_token = old_token.get("refresh_token")
+                refresh_token = old_token.get(
+                    "refresh_token"
+                )
+
+            # ------------------------------------------------
+            # Store token data
+            # ------------------------------------------------
 
             token_data = {
                 "token": credentials.token,
@@ -491,10 +568,23 @@ async def google_callback(
             }
 
             google_tokens["default"] = token_data
-            save_google_token(token_data)
 
-            # Consume OAuth state after the successful exchange.
-            oauth_sessions.pop(state, None)
+            save_google_token(
+                token_data
+            )
+
+            # ------------------------------------------------
+            # Consume OAuth state
+            # ------------------------------------------------
+
+            oauth_sessions.pop(
+                state,
+                None,
+            )
+
+            # ------------------------------------------------
+            # Redirect to Next.js
+            # ------------------------------------------------
 
             return RedirectResponse(
                 url=session_callback_url,
@@ -505,6 +595,7 @@ async def google_callback(
         raise
 
     except Exception as exc:
+
         raise HTTPException(
             status_code=400,
             detail=f"Google authentication failed: {exc}",
@@ -522,12 +613,20 @@ async def authentication_status():
         "default"
     )
 
+    # --------------------------------------------------------
+    # Try loading persisted token
+    # --------------------------------------------------------
+
     if not token_data:
 
         token_data = load_google_token()
 
         if token_data:
             google_tokens["default"] = token_data
+
+    # --------------------------------------------------------
+    # No authentication
+    # --------------------------------------------------------
 
     if not token_data:
 
@@ -539,9 +638,17 @@ async def authentication_status():
 
     try:
 
+        # ----------------------------------------------------
+        # Convert token data to credentials
+        # ----------------------------------------------------
+
         credentials = token_data_to_credentials(
             token_data
         )
+
+        # ----------------------------------------------------
+        # Refresh expired credentials
+        # ----------------------------------------------------
 
         if credentials.expired:
 
@@ -549,17 +656,93 @@ async def authentication_status():
                 credentials
             )
 
+        # ----------------------------------------------------
+        # Validate access token
+        # ----------------------------------------------------
+
+        if not credentials.token:
+
+            return {
+                "authenticated": False,
+                "has_access_token": False,
+                "has_refresh_token": bool(
+                    credentials.refresh_token
+                ),
+            }
+
+        # ----------------------------------------------------
+        # Fetch Google user profile
+        # ----------------------------------------------------
+
+        async with httpx.AsyncClient(
+            timeout=10.0
+        ) as client:
+
+            response = await client.get(
+                "https://www.googleapis.com/oauth2/v3/userinfo",
+                headers={
+                    "Authorization": (
+                        f"Bearer {credentials.token}"
+                    )
+                },
+            )
+
+        # ----------------------------------------------------
+        # Google profile request failed
+        # ----------------------------------------------------
+
+        if response.status_code != 200:
+
+            return {
+                "authenticated": False,
+                "has_access_token": True,
+                "has_refresh_token": bool(
+                    credentials.refresh_token
+                ),
+                "error": (
+                    "Unable to retrieve Google user profile."
+                ),
+            }
+
+        google_user = response.json()
+
+        # ----------------------------------------------------
+        # Validate Google subject ID
+        # ----------------------------------------------------
+
+        google_user_id = google_user.get(
+            "sub"
+        )
+
+        if not google_user_id:
+
+            return {
+                "authenticated": False,
+                "has_access_token": True,
+                "has_refresh_token": bool(
+                    credentials.refresh_token
+                ),
+                "error": "Google user ID is missing.",
+            }
+
+        # ----------------------------------------------------
+        # Return authentication information
+        # ----------------------------------------------------
+
         return {
-            "authenticated": bool(
-                credentials.token
-            ),
-            "has_access_token": bool(
-                credentials.token
-            ),
+            "authenticated": True,
+            "has_access_token": True,
             "has_refresh_token": bool(
                 credentials.refresh_token
             ),
             "scopes": credentials.scopes,
+            "user": {
+                "id": google_user_id,
+                "name": google_user.get("name"),
+                "email": google_user.get("email"),
+                "picture": google_user.get("picture"),
+                "role": "analyst",
+            },
         }
 
     except Exception as exc:
@@ -568,12 +751,11 @@ async def authentication_status():
             "authenticated": False,
             "has_access_token": False,
             "has_refresh_token": bool(
-                token_data.get(
-                    "refresh_token"
-                )
+                token_data.get("refresh_token")
             ),
             "error": str(exc),
         }
+
 
 
 # ============================================================
