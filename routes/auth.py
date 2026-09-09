@@ -1,13 +1,16 @@
+import base64
+import hashlib
 import json
 import os
 import secrets
+import time
 from pathlib import Path
-import requests
 
+import requests
+from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import RedirectResponse
-from dotenv import load_dotenv
-
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -54,6 +57,172 @@ FRONTEND_URL = os.getenv(
 
 
 # ============================================================
+# OAUTH STATE CONFIGURATION
+# ============================================================
+
+OAUTH_STATE_SECRET = os.getenv(
+    "OAUTH_STATE_SECRET"
+)
+
+if not OAUTH_STATE_SECRET:
+    raise RuntimeError(
+        "OAUTH_STATE_SECRET is not configured."
+    )
+
+
+OAUTH_STATE_MAX_AGE = 600  # 10 minutes
+
+
+# ============================================================
+# OAUTH STATE ENCRYPTION
+# ============================================================
+
+def get_oauth_state_fernet() -> Fernet:
+    """
+    Derive a stable Fernet encryption key from OAUTH_STATE_SECRET.
+
+    Fernet provides:
+    - Encryption
+    - Authentication
+    - Integrity protection
+    """
+
+    key_material = hashlib.sha256(
+        OAUTH_STATE_SECRET.encode("utf-8")
+    ).digest()
+
+    fernet_key = base64.urlsafe_b64encode(
+        key_material
+    )
+
+    return Fernet(fernet_key)
+
+
+def create_oauth_state(
+    code_verifier: str,
+) -> str:
+    """
+    Create a stateless encrypted OAuth state.
+
+    The state contains:
+    - issued-at timestamp
+    - PKCE code verifier
+    - random nonce
+
+    No server-side session storage is required.
+    """
+
+    payload = {
+        "iat": int(time.time()),
+        "code_verifier": code_verifier,
+        "nonce": secrets.token_urlsafe(32),
+    }
+
+    payload_bytes = json.dumps(
+        payload,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    fernet = get_oauth_state_fernet()
+
+    encrypted_state = fernet.encrypt(
+        payload_bytes
+    )
+
+    return encrypted_state.decode("utf-8")
+
+
+def verify_oauth_state(
+    state: str,
+) -> dict:
+    """
+    Decrypt and validate an OAuth state token.
+    """
+
+    if not state:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state is missing.",
+        )
+
+    try:
+        fernet = get_oauth_state_fernet()
+
+        decrypted = fernet.decrypt(
+            state.encode("utf-8"),
+            ttl=OAUTH_STATE_MAX_AGE,
+        )
+
+        payload = json.loads(
+            decrypted.decode("utf-8")
+        )
+
+    except InvalidToken:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired OAuth state.",
+        )
+
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed OAuth state.",
+        )
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to validate OAuth state.",
+        )
+
+    # --------------------------------------------------------
+    # Validate payload
+    # --------------------------------------------------------
+
+    issued_at = payload.get("iat")
+    code_verifier = payload.get("code_verifier")
+    nonce = payload.get("nonce")
+
+    if not issued_at:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state timestamp is missing.",
+        )
+
+    if not code_verifier:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth code verifier is missing.",
+        )
+
+    if not nonce:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state nonce is missing.",
+        )
+
+    # --------------------------------------------------------
+    # Additional expiration validation
+    # --------------------------------------------------------
+
+    current_time = int(time.time())
+
+    if current_time - int(issued_at) > OAUTH_STATE_MAX_AGE:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state has expired.",
+        )
+
+    if int(issued_at) > current_time + 60:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state timestamp is invalid.",
+        )
+
+    return payload
+
+
+# ============================================================
 # GOOGLE SCOPES
 # ============================================================
 
@@ -76,12 +245,10 @@ TOKEN_FILE = (
 
 
 # ============================================================
-# IN-MEMORY STATE
+# IN-MEMORY TOKEN CACHE
 # ============================================================
 
 google_tokens = {}
-
-oauth_sessions = {}
 
 
 # ============================================================
@@ -95,6 +262,7 @@ def save_google_token(
     Save Google OAuth credentials to token.json.
 
     Development/hackathon storage only.
+
     Production should use secure user-specific storage.
     """
 
@@ -180,12 +348,12 @@ def create_google_flow(
 
     if not GOOGLE_CLIENT_ID:
         raise RuntimeError(
-            "GOOGLE_CLIENT_ID is not configured in .env"
+            "GOOGLE_CLIENT_ID is not configured."
         )
 
     if not GOOGLE_CLIENT_SECRET:
         raise RuntimeError(
-            "GOOGLE_CLIENT_SECRET is not configured in .env"
+            "GOOGLE_CLIENT_SECRET is not configured."
         )
 
     client_config = {
@@ -339,6 +507,12 @@ def get_google_credentials() -> Credentials:
 
 @router.get("/google")
 async def google_login():
+    """
+    Start Google OAuth authentication.
+
+    PKCE verifier is embedded inside an encrypted,
+    stateless OAuth state token.
+    """
 
     try:
 
@@ -350,6 +524,18 @@ async def google_login():
             64
         )
 
+        # ----------------------------------------------------
+        # Create encrypted stateless OAuth state
+        # ----------------------------------------------------
+
+        state = create_oauth_state(
+            code_verifier
+        )
+
+        # ----------------------------------------------------
+        # Create Google OAuth flow
+        # ----------------------------------------------------
+
         flow = create_google_flow(
             code_verifier=code_verifier
         )
@@ -358,21 +544,18 @@ async def google_login():
         # Generate authorization URL
         # ----------------------------------------------------
 
-        authorization_url, state = (
+        authorization_url, _ = (
             flow.authorization_url(
                 access_type="offline",
                 include_granted_scopes="true",
                 prompt="consent",
+                state=state,
             )
         )
 
         # ----------------------------------------------------
-        # Store state + verifier
+        # Redirect user to Google
         # ----------------------------------------------------
-
-        oauth_sessions[state] = {
-            "code_verifier": code_verifier,
-        }
 
         return RedirectResponse(
             url=authorization_url
@@ -397,32 +580,32 @@ async def google_callback(
     code: str,
     state: str,
 ):
+    """
+    Handle Google OAuth callback.
+
+    The OAuth state is verified without relying on
+    server-side memory.
+    """
 
     try:
 
         # ----------------------------------------------------
-        # Validate OAuth state
+        # Validate and decrypt OAuth state
         # ----------------------------------------------------
 
-        session = oauth_sessions.get(
+        state_payload = verify_oauth_state(
             state
         )
 
-        if not session:
+        # ----------------------------------------------------
+        # Extract PKCE verifier
+        # ----------------------------------------------------
 
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Invalid or expired OAuth state."
-                ),
-            )
-
-        code_verifier = session.get(
+        code_verifier = state_payload.get(
             "code_verifier"
         )
 
         if not code_verifier:
-
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -449,7 +632,6 @@ async def google_callback(
         credentials = flow.credentials
 
         if not credentials.token:
-
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -498,15 +680,6 @@ async def google_callback(
 
         save_google_token(
             token_data
-        )
-
-        # ----------------------------------------------------
-        # Remove used OAuth state
-        # ----------------------------------------------------
-
-        oauth_sessions.pop(
-            state,
-            None,
         )
 
         # ----------------------------------------------------

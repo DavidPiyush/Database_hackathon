@@ -73,6 +73,7 @@ class GeoIPError(Exception):
 
 def _safe_str(value: Any) -> str | None:
     """Convert a value to string safely."""
+
     if value is None:
         return None
 
@@ -94,6 +95,7 @@ def _normalize_ip(ip: str) -> str:
 
     try:
         return str(ipaddress.ip_address(ip))
+
     except ValueError as exc:
         raise GeoIPError(f"Invalid IP address: {ip}") from exc
 
@@ -186,10 +188,12 @@ def get_geoip_status() -> dict[str, Any]:
 
     return {
         "geoip2_library": GEOIP2_AVAILABLE,
+
         "city_database": {
             "path": str(CITY_DB_PATH),
             "exists": CITY_DB_PATH.exists(),
         },
+
         "asn_database": {
             "path": str(ASN_DB_PATH),
             "exists": ASN_DB_PATH.exists(),
@@ -253,6 +257,7 @@ def lookup_city(ip: str) -> dict[str, Any]:
         result["error"] = (
             "IP is not a public globally routable address"
         )
+
         return result
 
     try:
@@ -320,16 +325,19 @@ def lookup_city(ip: str) -> dict[str, Any]:
         result["error"] = (
             "IP address not present in GeoIP database"
         )
+
         return result
 
     except GeoIPError as exc:
         result["error"] = str(exc)
+
         return result
 
     except Exception as exc:
         result["error"] = (
             f"GeoIP lookup failed: {exc}"
         )
+
         return result
 
 
@@ -360,6 +368,7 @@ def lookup_asn(ip: str) -> dict[str, Any]:
         result["error"] = (
             "IP is not a public globally routable address"
         )
+
         return result
 
     try:
@@ -373,14 +382,17 @@ def lookup_asn(ip: str) -> dict[str, Any]:
                 {
                     "success": True,
                     "source": "MaxMind GeoIP",
+
                     "asn": (
                         response.autonomous_system_number
                         if response.autonomous_system_number
                         else None
                     ),
+
                     "organization": _safe_str(
                         response.autonomous_system_organization
                     ),
+
                     "network": (
                         str(network)
                         if network
@@ -395,16 +407,19 @@ def lookup_asn(ip: str) -> dict[str, Any]:
         result["error"] = (
             "IP address not present in ASN database"
         )
+
         return result
 
     except GeoIPError as exc:
         result["error"] = str(exc)
+
         return result
 
     except Exception as exc:
         result["error"] = (
             f"ASN lookup failed: {exc}"
         )
+
         return result
 
 
@@ -532,9 +547,7 @@ def build_geo_signals(
     """
     Convert GeoIP intelligence into explainable evidence signals.
 
-    IMPORTANT:
-        Geolocation itself is NOT treated as proof of maliciousness.
-
+    Geolocation itself is NOT treated as proof of maliciousness.
     Geographic information is primarily contextual evidence.
     """
 
@@ -650,26 +663,6 @@ def get_ip_geolocation(ip: str) -> dict[str, Any]:
     return analyze_geoip(ip)
 
 
-def get_geoip_status() -> dict[str, Any]:
-    """
-    Public health/status endpoint helper.
-    """
-
-    return {
-        "service": "GeoIP Intelligence",
-        "status": (
-            "ready"
-            if GEOIP2_AVAILABLE
-            else "dependency_missing"
-        ),
-        "geoip2_installed": GEOIP2_AVAILABLE,
-        "city_database": str(CITY_DB_PATH),
-        "city_database_available": CITY_DB_PATH.exists(),
-        "asn_database": str(ASN_DB_PATH),
-        "asn_database_available": ASN_DB_PATH.exists(),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Module Test
 # ---------------------------------------------------------------------------
@@ -689,7 +682,6 @@ if __name__ == "__main__":
 
     try:
         result = analyze_geoip(test_ip)
-
         print(result)
 
     except Exception as exc:
